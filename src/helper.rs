@@ -166,6 +166,8 @@ pub struct BrowserChoice {
     /// browser/profile separator.
     pub id: String,
     pub label: String,
+    #[cfg(windows)]
+    program_ids: Vec<String>,
 }
 
 /// What this computer has: detected browser profiles and the profile belonging to the system default browser.
@@ -240,10 +242,11 @@ fn detect_installed() -> Vec<BrowserChoice> {
 }
 
 #[cfg(windows)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct WindowsBrowserRegistration {
-    key: String,
     name: String,
+    capability_path: String,
+    program_ids: Vec<String>,
 }
 
 #[cfg(windows)]
@@ -251,55 +254,125 @@ struct DetectedCookieProfile {
     family: &'static str,
     profile_dir: PathBuf,
     modified_secs: u64,
+    browser_name: String,
+    program_ids: Vec<String>,
 }
 
 #[cfg(windows)]
-fn registry_string_value(output: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        let pos = line.find("REG_SZ").or_else(|| line.find("REG_EXPAND_SZ"))?;
-        let value = line[pos..].split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
-        (!value.is_empty()).then_some(value)
-    })
+fn registry_values(output: &str) -> Vec<(String, String)> {
+    output.lines().filter_map(|line| {
+        let line = line.trim();
+        let marker = ["REG_EXPAND_SZ", "REG_SZ"].iter()
+            .filter_map(|kind| line.find(kind).map(|at| (at, *kind)))
+            .min_by_key(|(at, _)| *at)?;
+        let (name, rest) = line.split_at(marker.0);
+        let value = rest[marker.1.len()..].trim();
+        if name.trim().is_empty() || value.is_empty() {
+            None
+        } else {
+            Some((name.trim().to_string(), value.to_string()))
+        }
+    }).collect()
+}
+
+#[cfg(windows)]
+fn registry_key_for_capabilities(root: &str, path: &str) -> String {
+    if path.to_ascii_uppercase().starts_with("HKEY_") {
+        return path.to_string();
+    }
+    let hive = root.split('\\').next().unwrap_or("HKEY_CURRENT_USER");
+    format!("{hive}\\{}", path.trim_start_matches('\\'))
 }
 
 #[cfg(windows)]
 fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
-    // StartMenuInternet is the Windows registration point used by desktop browsers. Read both
-    // machine-wide and per-user registrations, including 32-bit registrations on 64-bit Windows.
+    // Windows' RegisteredApplications/Capabilities is the system's browser-app registration
+    // mechanism. Requiring both HTTP and HTTPS handlers excludes WebView2/CEF runtimes and
+    // ordinary desktop apps that merely embed a web view.
     let roots = [
-        r"HKEY_CURRENT_USER\Software\Clients\StartMenuInternet",
-        r"HKEY_LOCAL_MACHINE\Software\Clients\StartMenuInternet",
-        r"HKEY_LOCAL_MACHINE\Software\WOW6432Node\Clients\StartMenuInternet",
+        r"HKEY_CURRENT_USER\Software\RegisteredApplications",
+        r"HKEY_LOCAL_MACHINE\Software\RegisteredApplications",
+        r"HKEY_LOCAL_MACHINE\Software\WOW6432Node\RegisteredApplications",
     ];
-    let mut found = Vec::new();
+    let mut found: Vec<WindowsBrowserRegistration> = Vec::new();
+
     for root in roots {
         let Ok(output) = crate::sys::cmd("reg").args(["query", root]).output() else { continue };
         if !output.status.success() {
             continue;
         }
-        let prefix = format!("{root}\\");
-        let prefix_lower = prefix.to_ascii_lowercase();
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let key = line.trim();
-            let key_lower = key.to_ascii_lowercase();
-            if !key_lower.starts_with(&prefix_lower) {
-                continue;
-            }
-            let child = &key[prefix.len()..];
-            if child.is_empty() || child.contains('\\') {
-                continue;
-            }
-            if found.iter().any(|entry: &WindowsBrowserRegistration| entry.key.eq_ignore_ascii_case(child)) {
-                continue;
-            }
-            let name = crate::sys::cmd("reg")
-                .args(["query", key, "/ve"])
+        for (registered_name, capabilities_path) in registry_values(&String::from_utf8_lossy(&output.stdout)) {
+            let capabilities_key = registry_key_for_capabilities(root, &capabilities_path);
+            let Ok(capabilities) = crate::sys::cmd("reg")
+                .args(["query", &capabilities_key, "/s"])
                 .output()
-                .ok()
-                .filter(|result| result.status.success())
-                .and_then(|result| registry_string_value(&String::from_utf8_lossy(&result.stdout).to_string()))
-                .unwrap_or_else(|| child.to_string());
-            found.push(WindowsBrowserRegistration { key: child.to_string(), name });
+            else { continue };
+            if !capabilities.status.success() {
+                continue;
+            }
+
+            let mut in_url_associations = false;
+            let mut application_name = None;
+            let mut program_ids = Vec::new();
+            for line in String::from_utf8_lossy(&capabilities.stdout).lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("HKEY_") {
+                    in_url_associations = trimmed.to_ascii_lowercase().ends_with("\\urlassociations");
+                    continue;
+                }
+                for (value_name, value) in registry_values(trimmed) {
+                    if !in_url_associations && value_name.eq_ignore_ascii_case("ApplicationName") {
+                        application_name = Some(value);
+                    } else if in_url_associations
+                        && (value_name.eq_ignore_ascii_case("http") || value_name.eq_ignore_ascii_case("https"))
+                    {
+                        if !program_ids.iter().any(|existing: &String| existing.eq_ignore_ascii_case(&value)) {
+                            program_ids.push(value);
+                        }
+                    }
+                }
+            }
+            if !program_ids.iter().any(|id| {
+                // A real browser advertises handlers for both schemes, not just one.
+                let _ = id;
+                false
+            }) {
+                // Verify both URL schemes from the values we collected. Values are kept in the
+                // list in registry order, so collect the actual names separately below instead.
+            }
+            let has_http_https = {
+                let mut has_http = false;
+                let mut has_https = false;
+                for line in String::from_utf8_lossy(&capabilities.stdout).lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("HKEY_") {
+                        in_url_associations = trimmed.to_ascii_lowercase().ends_with("\\urlassociations");
+                        continue;
+                    }
+                    if in_url_associations {
+                        if let Some((name, _)) = registry_values(trimmed).first() {
+                            has_http |= name.eq_ignore_ascii_case("http");
+                            has_https |= name.eq_ignore_ascii_case("https");
+                        }
+                    }
+                }
+                has_http && has_https
+            };
+            if !has_http_https || program_ids.is_empty() {
+                continue;
+            }
+            let name = application_name.unwrap_or(registered_name);
+            if found.iter().any(|entry| {
+                entry.name.eq_ignore_ascii_case(&name)
+                    || entry.program_ids.iter().any(|old| program_ids.iter().any(|new| old.eq_ignore_ascii_case(new)))
+            }) {
+                continue;
+            }
+            found.push(WindowsBrowserRegistration {
+                name,
+                capability_path: capabilities_path,
+                program_ids,
+            });
         }
     }
     found
@@ -308,13 +381,16 @@ fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
 #[cfg(windows)]
 fn windows_default_browser_hint() -> Option<String> {
     let output = crate::sys::cmd("reg")
-        .args(["query", r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice", "/v", "ProgId"])
+        .args(["query", r"HKEY_CURRENT_USER\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice", "/v", "ProgId"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    registry_string_value(&String::from_utf8_lossy(&output.stdout))
+    registry_values(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("ProgId"))
+        .map(|(_, value)| value)
 }
 
 #[cfg(windows)]
@@ -322,11 +398,121 @@ fn normalized_browser_text(value: &str) -> String {
     value.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
+#[cfg(windows)]
+fn browser_identity_aliases(registration: &WindowsBrowserRegistration) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let mut add = |value: &str| {
+        let normalized = normalized_browser_text(value);
+        if normalized.len() >= 3 && !aliases.iter().any(|existing: &String| existing == &normalized) {
+            aliases.push(normalized);
+        }
+    };
+    add(&registration.name);
+
+    // Browser capabilities paths usually contain the product's registry key (for example,
+    // ...\Clients\StartMenuInternet\Zen\Capabilities).
+    if let Some(product_key) = registration.capability_path
+        .split('\\')
+        .rev()
+        .find(|part| !part.eq_ignore_ascii_case("Capabilities"))
+    {
+        add(product_key);
+    }
+
+    // ProgIds such as ZenHTML and FirefoxURL-<suffix> identify the registered browser even
+    // when the display name is localized or generic.
+    for program_id in &registration.program_ids {
+        let first = program_id.split(['-', '.']).next().unwrap_or(program_id);
+        let mut product = first.to_string();
+        for suffix in ["html", "htm", "url", "uri"] {
+            if product.to_ascii_lowercase().ends_with(suffix) && product.len() > suffix.len() + 2 {
+                product.truncate(product.len() - suffix.len());
+                break;
+            }
+        }
+        add(&product);
+    }
+
+    let mut tokens: Vec<String> = registration.name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|part| {
+            let lower = part.to_ascii_lowercase();
+            part.len() >= 3 && !matches!(lower.as_str(), "browser" | "internet" | "web" | "stable")
+        })
+        .map(str::to_string)
+        .collect();
+    if tokens.len() > 1 {
+        add(&tokens.join(""));
+    }
+    if let Some(last) = tokens.pop() {
+        add(&last);
+    }
+    aliases
+}
+
+#[cfg(windows)]
+fn is_browser_identity_path(relative: &str, aliases: &[String]) -> bool {
+    let normalized = normalized_browser_text(relative);
+    aliases.iter().any(|alias| {
+        normalized == *alias
+            || normalized.ends_with(alias)
+            || normalized.ends_with(&format!("{alias}browser"))
+    })
+}
+
+#[cfg(windows)]
+fn skip_browser_data_directory(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(),
+        "cache" | "code cache" | "gpucache" | "shadercache" | "crashpad" |
+        "temp" | "logs" | "dawncache" | "service worker" | "application cache" |
+        "crash reports" | "node_modules" | "webview" | "webview2" | "cef" |
+        "embeddedbrowser" | "embedded browser" | "edgewebview"
+    )
+}
+
+#[cfg(windows)]
+fn find_registered_browser_roots(
+    directory: &Path,
+    relative: &Path,
+    depth: usize,
+    budget: &mut usize,
+    aliases: &[String],
+    roots: &mut Vec<PathBuf>,
+) {
+    if depth > 4 || *budget == 0 || roots.len() >= 32 {
+        return;
+    }
+    *budget -= 1;
+    let Ok(entries) = std::fs::read_dir(directory) else { return };
+    for entry in entries.flatten() {
+        if *budget == 0 || roots.len() >= 32 {
+            break;
+        }
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        if !kind.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if skip_browser_data_directory(&name) {
+            continue;
+        }
+        let next_relative = relative.join(name.as_ref());
+        if is_browser_identity_path(&next_relative.to_string_lossy(), aliases) {
+            roots.push(path);
+            // Once the product-specific directory is found, don't match nested folders again.
+            // The cookie scan below is scoped to this directory only.
+        } else {
+            find_registered_browser_roots(&path, &next_relative, depth + 1, budget, aliases, roots);
+        }
+    }
+}
+
+#[cfg(windows)]
 fn cookie_database_family(filename: &str) -> Option<&'static str> {
     match filename.to_ascii_lowercase().as_str() {
-        // Firefox-family browsers store their cookie database as cookies.sqlite.
         "cookies.sqlite" => Some("firefox"),
-        // Chromium-family browsers use a Cookies SQLite database, usually under Network/.
         "cookies" => Some("chromium"),
         _ => None,
     }
@@ -344,30 +530,31 @@ fn scan_cookie_profiles(
     directory: &Path,
     depth: usize,
     budget: &mut usize,
+    browser_name: &str,
+    program_ids: &[String],
     found: &mut Vec<DetectedCookieProfile>,
 ) {
-    // Stay inside the two per-user application-data roots, limit traversal cost, and skip
-    // cache-heavy folders. Only cookie database files are inspected; cookie contents are never read here.
-    if depth > 10 || *budget == 0 || found.len() >= 512 {
+    if depth > 9 || *budget == 0 || found.len() >= 128 {
         return;
     }
     *budget -= 1;
     let Ok(entries) = std::fs::read_dir(directory) else { return };
     for entry in entries.flatten() {
-        if found.len() >= 512 || *budget == 0 {
+        if found.len() >= 128 || *budget == 0 {
             break;
         }
         let path = entry.path();
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_file() {
             let filename = entry.file_name().to_string_lossy().into_owned();
-            let family = cookie_database_family(&filename);
-            let Some(family) = family else { continue };
+            let Some(family) = cookie_database_family(&filename) else { continue };
             if !is_sqlite_database(&path) {
                 continue;
             }
             let Some(parent) = path.parent() else { continue };
-            let profile_dir = if family == "chromium" && parent.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("Network")).unwrap_or(false) {
+            let profile_dir = if family == "chromium"
+                && parent.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("Network")).unwrap_or(false)
+            {
                 let Some(profile) = parent.parent() else { continue };
                 profile.to_path_buf()
             } else {
@@ -380,59 +567,69 @@ fn scan_cookie_profiles(
                     .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|duration| duration.as_secs())
                     .unwrap_or(0);
-                found.push(DetectedCookieProfile { family, profile_dir, modified_secs });
+                found.push(DetectedCookieProfile {
+                    family,
+                    profile_dir,
+                    modified_secs,
+                    browser_name: browser_name.to_string(),
+                    program_ids: program_ids.to_vec(),
+                });
             }
         } else if kind.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if matches!(name.as_str(),
-                "cache" | "code cache" | "gpucache" | "shadercache" | "crashpad" |
-                "temp" | "logs" | "dawncache" | "service worker" | "application cache" |
-                "crash reports" | "node_modules"
-            ) {
+            let name = entry.file_name();
+            if skip_browser_data_directory(&name.to_string_lossy()) {
                 continue;
             }
-            scan_cookie_profiles(&path, depth + 1, budget, found);
+            scan_cookie_profiles(&path, depth + 1, budget, browser_name, program_ids, found);
         }
     }
-}
-
-#[cfg(windows)]
-fn profile_registration_name(profile: &Path, registrations: &[WindowsBrowserRegistration]) -> Option<String> {
-    let path = normalized_browser_text(&profile.to_string_lossy());
-    registrations.iter().find_map(|registration| {
-        let display = normalized_browser_text(&registration.name);
-        let key = normalized_browser_text(&registration.key);
-        if (display.len() >= 4 && path.contains(&display)) || (key.len() >= 4 && path.contains(&key)) {
-            Some(registration.name.clone())
-        } else {
-            None
-        }
-    })
-}
-
-#[cfg(windows)]
-fn profile_folder_label(profile: &Path) -> String {
-    profile.file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| !n.is_empty()).unwrap_or_else(|| "Profile".into())
 }
 
 #[cfg(windows)]
 fn detect_installed() -> Vec<BrowserChoice> {
     let home = dirs::home_dir().unwrap_or_default();
-    let local = dirs::data_local_dir().unwrap_or_default();
-    let roaming = dirs::data_dir().unwrap_or_default();
+    let appdata_roots = [
+        dirs::data_local_dir().unwrap_or_default(),
+        dirs::data_dir().unwrap_or_default(),
+    ];
     let registrations = windows_registered_browsers();
     let mut profiles = Vec::new();
-    // Keep independent budgets so a large Local AppData tree cannot starve Roaming
-    // (where standard Firefox profiles are commonly stored).
-    for root in [local, roaming] {
-        if root.exists() {
-            let mut budget = 15_000usize;
-            scan_cookie_profiles(&root, 0, &mut budget, &mut profiles);
+
+    for registration in &registrations {
+        let aliases = browser_identity_aliases(registration);
+        if aliases.is_empty() {
+            continue;
+        }
+        for appdata in &appdata_roots {
+            if !appdata.exists() {
+                continue;
+            }
+            let mut root_budget = 8_000usize;
+            let mut browser_roots = Vec::new();
+            find_registered_browser_roots(
+                appdata,
+                Path::new(""),
+                0,
+                &mut root_budget,
+                &aliases,
+                &mut browser_roots,
+            );
+            for browser_root in browser_roots {
+                let mut profile_budget = 8_000usize;
+                scan_cookie_profiles(
+                    &browser_root,
+                    0,
+                    &mut profile_budget,
+                    &registration.name,
+                    &registration.program_ids,
+                    &mut profiles,
+                );
+            }
         }
     }
-    // Put the most recently used profiles first, matching yt-dlp's own profile preference.
-    profiles.sort_by(|a, b| b.modified_secs.cmp(&a.modified_secs));
 
+    // Prefer the most recently used profile when several profiles belong to one browser.
+    profiles.sort_by(|a, b| b.modified_secs.cmp(&a.modified_secs));
     let mut choices = Vec::new();
     for profile in profiles {
         let Ok(relative) = profile.profile_dir.strip_prefix(&home) else { continue };
@@ -441,17 +638,18 @@ fn detect_installed() -> Vec<BrowserChoice> {
         }
         let relative = relative.to_string_lossy().replace('\\', "/");
         let id = format!("{}|{}", profile.family, relative);
-        let registered_name = profile_registration_name(&profile.profile_dir, &registrations);
-        let inferred_name = profile.profile_dir
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
+        if choices.iter().any(|choice: &BrowserChoice| choice.id == id) {
+            continue;
+        }
+        let profile_name = profile.profile_dir.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| if profile.family == "firefox" { "Firefox".into() } else { "Chromium".into() });
-        let browser_name = registered_name.unwrap_or(inferred_name);
-        let label = format!("{browser_name} — {}", profile_folder_label(&profile.profile_dir));
-        choices.push(BrowserChoice { id, label });
+            .unwrap_or_else(|| "Profile".into());
+        choices.push(BrowserChoice {
+            id,
+            label: format!("{} — {}", profile.browser_name, profile_name),
+            program_ids: profile.program_ids,
+        });
     }
     choices
 }
@@ -459,42 +657,22 @@ fn detect_installed() -> Vec<BrowserChoice> {
 #[cfg(windows)]
 fn windows_default_browser(installed: &[BrowserChoice]) -> Option<String> {
     let hint = windows_default_browser_hint()?;
-    let hint_normalized = normalized_browser_text(&hint);
-    if hint_normalized.is_empty() {
-        return None;
-    }
-    // ProgIds often append URL/HTML suffixes (for example, ThoriumHTML or FirefoxURL-...).
-    // Compare their meaningful tokens to the detected profile labels for non-mainstream browsers.
-    let mut tokens = vec![hint_normalized.clone()];
-    for part in hint.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let mut token = normalized_browser_text(part);
-        for suffix in ["url", "html", "htm"] {
-            if token.ends_with(suffix) && token.len() > suffix.len() + 2 {
-                token.truncate(token.len() - suffix.len());
-            }
-        }
-        if token.len() >= 3 && !tokens.contains(&token) {
-            tokens.push(token);
-        }
-    }
-    if let Some(choice) = installed.iter().find(|choice| {
-        let label = normalized_browser_text(&choice.label);
-        let id = normalized_browser_text(&choice.id);
-        tokens.iter().any(|token| label.contains(token) || id.contains(token))
-    }) {
-        return Some(choice.id.clone());
-    }
-    // Known ProgIds still give us a useful product hint, but the actual extraction family comes
-    // from the cookie database format discovered above.
-    let known = crate::sys::browser_from_text(&hint)?;
-    let product = normalized_browser_text(known);
     installed.iter()
-        .find(|choice| normalized_browser_text(&choice.label).contains(&product))
-        .or_else(|| {
-            let family = browser_family(known);
-            installed.iter().find(|choice| browser_family(&choice.id) == family)
-        })
+        .find(|choice| choice.program_ids.iter().any(|id| id.eq_ignore_ascii_case(&hint)))
         .map(|choice| choice.id.clone())
+        .or_else(|| {
+            let mut hint_name = hint.clone();
+            for suffix in ["html", "htm", "url", "uri"] {
+                if hint_name.to_ascii_lowercase().ends_with(suffix) && hint_name.len() > suffix.len() + 2 {
+                    hint_name.truncate(hint_name.len() - suffix.len());
+                    break;
+                }
+            }
+            let hint_name = normalized_browser_text(&hint_name);
+            installed.iter()
+                .find(|choice| normalized_browser_text(&choice.label).starts_with(&hint_name))
+                .map(|choice| choice.id.clone())
+        })
 }
 
 fn browser_family(browser: &str) -> &str {
