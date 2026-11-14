@@ -594,55 +594,59 @@ fn firefox_cookie_profile_modified(directory: &Path) -> u64 {
 #[cfg(windows)]
 fn scan_firefox_profiles(
     directory: &Path,
-    depth: usize,
     budget: &mut usize,
     found: &mut Vec<DetectedCookieProfile>,
 ) {
-    if depth > 8 || *budget == 0 || found.len() >= 128 {
-        return;
-    }
-    *budget -= 1;
-    let Ok(entries) = std::fs::read_dir(directory) else { return };
-    for entry in entries.flatten() {
-        if *budget == 0 || found.len() >= 128 {
+    // Breadth-first traversal ensures shallow product roots (such as Local\zen\Profiles)
+    // are checked before spending the search budget inside large AppData vendor folders.
+    let mut pending = std::collections::VecDeque::from([(directory.to_path_buf(), 0usize)]);
+    while let Some((current, depth)) = pending.pop_front() {
+        if depth > 8 || *budget == 0 || found.len() >= 128 {
             break;
         }
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
-        if !kind.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if skip_browser_data_directory(&name) {
-            continue;
-        }
-        if name.eq_ignore_ascii_case("profiles") {
-            let browser_name = firefox_profile_browser_name(&path);
-            let Ok(profile_entries) = std::fs::read_dir(&path) else { continue };
-            for profile_entry in profile_entries.flatten() {
-                if found.len() >= 128 {
-                    break;
-                }
-                let profile_path = profile_entry.path();
-                if !profile_entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
-                    || !is_firefox_cookie_profile(&profile_path)
-                {
-                    continue;
-                }
-                if !found.iter().any(|profile| profile.profile_dir == profile_path) {
-                    found.push(DetectedCookieProfile {
-                        family: "firefox",
-                        profile_dir: profile_path.clone(),
-                        modified_secs: firefox_cookie_profile_modified(&profile_path),
-                        browser_name: browser_name.clone(),
-                        program_ids: Vec::new(),
-                    });
-                }
+        *budget -= 1;
+        let Ok(entries) = std::fs::read_dir(&current) else { continue };
+        for entry in entries.flatten() {
+            if *budget == 0 || found.len() >= 128 {
+                break;
             }
-            continue;
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else { continue };
+            if !kind.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if skip_browser_data_directory(&name) {
+                continue;
+            }
+            if name.eq_ignore_ascii_case("profiles") {
+                let browser_name = firefox_profile_browser_name(&path);
+                let Ok(profile_entries) = std::fs::read_dir(&path) else { continue };
+                for profile_entry in profile_entries.flatten() {
+                    if found.len() >= 128 {
+                        break;
+                    }
+                    let profile_path = profile_entry.path();
+                    if !profile_entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                        || !is_firefox_cookie_profile(&profile_path)
+                    {
+                        continue;
+                    }
+                    if !found.iter().any(|profile| profile.profile_dir == profile_path) {
+                        found.push(DetectedCookieProfile {
+                            family: "firefox",
+                            profile_dir: profile_path.clone(),
+                            modified_secs: firefox_cookie_profile_modified(&profile_path),
+                            browser_name: browser_name.clone(),
+                            program_ids: Vec::new(),
+                        });
+                    }
+                }
+            } else if depth < 8 {
+                pending.push_back((path, depth + 1));
+            }
         }
-        scan_firefox_profiles(&path, depth + 1, budget, found);
     }
 }
 
@@ -699,7 +703,7 @@ fn detect_installed() -> Vec<BrowserChoice> {
             continue;
         }
         let mut profile_budget = 20_000usize;
-        scan_firefox_profiles(appdata, 0, &mut profile_budget, &mut profiles);
+        scan_firefox_profiles(appdata, &mut profile_budget, &mut profiles);
     }
 
     // Prefer the most recently used profile when several profiles belong to one browser.
