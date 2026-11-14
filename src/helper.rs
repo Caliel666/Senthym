@@ -267,9 +267,9 @@ fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
     // StartMenuInternet is the Windows registration point used by desktop browsers. Read both
     // machine-wide and per-user registrations, including 32-bit registrations on 64-bit Windows.
     let roots = [
-        r"HKCU\Software\Clients\StartMenuInternet",
-        r"HKLM\Software\Clients\StartMenuInternet",
-        r"HKLM\Software\WOW6432Node\Clients\StartMenuInternet",
+        r"HKEY_CURRENT_USER\Software\Clients\StartMenuInternet",
+        r"HKEY_LOCAL_MACHINE\Software\Clients\StartMenuInternet",
+        r"HKEY_LOCAL_MACHINE\Software\WOW6432Node\Clients\StartMenuInternet",
     ];
     let mut found = Vec::new();
     for root in roots {
