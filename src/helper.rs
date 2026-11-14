@@ -332,14 +332,6 @@ fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
                     }
                 }
             }
-            if !program_ids.iter().any(|id| {
-                // A real browser advertises handlers for both schemes, not just one.
-                let _ = id;
-                false
-            }) {
-                // Verify both URL schemes from the values we collected. Values are kept in the
-                // list in registry order, so collect the actual names separately below instead.
-            }
             let has_http_https = {
                 let mut has_http = false;
                 let mut has_https = false;
@@ -509,7 +501,6 @@ fn find_registered_browser_roots(
     }
 }
 
-#[cfg(windows)]
 fn cookie_database_family(filename: &str) -> Option<&'static str> {
     match filename.to_ascii_lowercase().as_str() {
         "cookies.sqlite" => Some("firefox"),
