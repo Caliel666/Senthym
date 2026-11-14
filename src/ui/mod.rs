@@ -1411,7 +1411,10 @@ pub fn browser_picker(ui: &mut egui::Ui, id: &str, width: f32, pick: &mut String
     // Prefer detected cookie profiles. If none are available, offer the generic engine families
     // (or the saved choice) rather than assuming a particular browser vendor.
     let mut offered: Vec<String> = if found.installed.is_empty() {
-        crate::helper::KNOWN_BROWSERS.iter().map(|name| name.to_string()).collect()
+        #[cfg(windows)]
+        { Vec::new() }
+        #[cfg(not(windows))]
+        { crate::helper::KNOWN_BROWSERS.iter().map(|name| name.to_string()).collect() }
     } else {
         found.installed.iter().map(|choice| choice.id.clone()).collect()
     };
@@ -1428,7 +1431,15 @@ pub fn browser_picker(ui: &mut egui::Ui, id: &str, width: f32, pick: &mut String
         }
         l
     };
-    let shown = if pick.is_empty() { "Choose your browser".to_string() } else { label(pick) };
+    let shown = if pick.is_empty() {
+        if found.installed.is_empty() && cfg!(windows) {
+            "No registered browser profiles found".to_string()
+        } else {
+            "Choose your browser".to_string()
+        }
+    } else {
+        label(pick)
+    };
     let before = pick.clone();
     // Test switch: open the list at once (to check it is drawn above the window it is in).
     if std::env::var_os("SENTHYM_TEST_OPEN_LIST").is_some() {
