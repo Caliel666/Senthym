@@ -653,7 +653,7 @@ pub fn settings(ui: &mut Ui, app: &mut App) {
     };
     // The browser the person chose, else the system's default one (or the first found).
     let mut pick = if app.store.settings.youtube_browser.is_empty() {
-        crate::helper::suggested_browser().map(String::from).unwrap_or_default()
+        crate::helper::suggested_browser().unwrap_or_default()
     } else {
         app.store.settings.youtube_browser.clone()
     };
