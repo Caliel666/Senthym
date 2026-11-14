@@ -143,60 +143,61 @@ pub fn cleanup_temp() {
     }
 }
 
-/// Use the YouTube sign-in saved in this browser (firefox, chrome, chromium, brave, edge…).
+/// The selected browser/profile used by yt-dlp to read the user's YouTube sign-in.
 static BROWSER: Mutex<String> = Mutex::new(String::new());
 
 pub fn set_browser(name: &str) {
     *BROWSER.lock().unwrap() = name.to_string();
 }
 
-/// The browsers the sign-in can be read from, in the order they are offered (the names the helper uses).
-pub const KNOWN_BROWSERS: &[&str] = if cfg!(target_os = "macos") {
-    &["safari", "chrome", "firefox", "edge", "brave", "vivaldi", "opera", "chromium"]
-} else {
-    &["chrome", "edge", "firefox", "brave", "vivaldi", "opera", "chromium"]
-};
+/// Browser engines supported by yt-dlp. On Windows these are file-format families, not a
+/// vendor-maintained list of browser products.
+#[cfg(windows)]
+pub const KNOWN_BROWSERS: &[&str] = &["firefox", "chromium"];
+#[cfg(target_os = "macos")]
+pub const KNOWN_BROWSERS: &[&str] = &["safari", "chrome", "firefox", "edge", "brave", "vivaldi", "opera", "chromium"];
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub const KNOWN_BROWSERS: &[&str] = &["chrome", "edge", "firefox", "brave", "vivaldi", "opera", "chromium"];
 
-/// What this computer has: the browsers the helper can read from, and the one that is the system's default.
-pub struct Browsers {
-    pub installed: Vec<&'static str>,
-    pub default: Option<&'static str>,
+#[derive(Clone)]
+pub struct BrowserChoice {
+    /// Stable setting value. Windows profile choices encode the detected engine and a path
+    /// relative to the user's home directory, so drive letters never collide with yt-dlp's
+    /// browser/profile separator.
+    pub id: String,
+    pub label: String,
 }
 
-/// Looked up once (it asks the system a few questions), the first time it is needed.
+/// What this computer has: detected browser profiles and the profile belonging to the system default browser.
+pub struct Browsers {
+    pub installed: Vec<BrowserChoice>,
+    pub default: Option<String>,
+}
+
+/// Looked up once, the first time the browser picker is needed.
 pub fn browsers() -> &'static Browsers {
     static B: std::sync::OnceLock<Browsers> = std::sync::OnceLock::new();
     B.get_or_init(|| {
         let installed = detect_installed();
-        let default = crate::sys::default_browser().filter(|d| KNOWN_BROWSERS.contains(d));
+        #[cfg(windows)]
+        let default = windows_default_browser(&installed);
+        #[cfg(not(windows))]
+        let default = crate::sys::default_browser()
+            .map(str::to_string)
+            .filter(|d| installed.iter().any(|b| b.id == *d));
         Browsers { installed, default }
     })
 }
 
-/// The browser to suggest when none was chosen yet: the system's default, else the first one found.
-pub fn suggested_browser() -> Option<&'static str> {
+/// The browser/profile to suggest when none was chosen yet.
+pub fn suggested_browser() -> Option<String> {
     let b = browsers();
-    b.default.or_else(|| b.installed.first().copied())
+    b.default.clone().or_else(|| b.installed.first().map(|choice| choice.id.clone()))
 }
 
-/// Where each browser keeps its profile on this system (a browser counts as installed when it exists).
+#[cfg(not(windows))]
 fn browser_profile_dirs() -> Vec<(&'static str, Vec<std::path::PathBuf>)> {
-    #[cfg(not(target_os = "windows"))]
     let home = dirs::home_dir().unwrap_or_default();
-    #[cfg(target_os = "windows")]
-    {
-        let local = dirs::data_local_dir().unwrap_or_default();
-        let roaming = dirs::data_dir().unwrap_or_default();
-        vec![
-            ("chrome", vec![local.join("Google/Chrome/User Data")]),
-            ("edge", vec![local.join("Microsoft/Edge/User Data")]),
-            ("firefox", vec![roaming.join("Mozilla/Firefox/Profiles")]),
-            ("brave", vec![local.join("BraveSoftware/Brave-Browser/User Data")]),
-            ("vivaldi", vec![local.join("Vivaldi/User Data")]),
-            ("opera", vec![roaming.join("Opera Software/Opera Stable")]),
-            ("chromium", vec![local.join("Chromium/User Data")]),
-        ]
-    }
     #[cfg(target_os = "macos")]
     {
         let base = home.join("Library/Application Support");
@@ -211,7 +212,7 @@ fn browser_profile_dirs() -> Vec<(&'static str, Vec<std::path::PathBuf>)> {
             ("chromium", vec![base.join("Chromium")]),
         ]
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
         let cfg = dirs::config_dir().unwrap_or_default();
         vec![
@@ -226,13 +227,265 @@ fn browser_profile_dirs() -> Vec<(&'static str, Vec<std::path::PathBuf>)> {
     }
 }
 
-fn detect_installed() -> Vec<&'static str> {
-    let dirs = browser_profile_dirs();
-    KNOWN_BROWSERS.iter().copied().filter(|name| dirs.iter().any(|(n, paths)| n == name && paths.iter().any(|p| p.exists()))).collect()
+#[cfg(not(windows))]
+fn detect_installed() -> Vec<BrowserChoice> {
+    browser_profile_dirs()
+        .into_iter()
+        .filter(|(_, paths)| paths.iter().any(|path| path.exists()))
+        .map(|(name, _)| BrowserChoice {
+            id: name.to_string(),
+            label: known_browser_label(name).to_string(),
+        })
+        .collect()
 }
 
-/// A short, friendly name for a browser.
-pub fn browser_label(name: &str) -> &'static str {
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsBrowserRegistration {
+    key: String,
+    name: String,
+}
+
+#[cfg(windows)]
+struct DetectedCookieProfile {
+    family: &'static str,
+    profile_dir: PathBuf,
+}
+
+#[cfg(windows)]
+fn registry_string_value(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let pos = line.find("REG_SZ").or_else(|| line.find("REG_EXPAND_SZ"))?;
+        let value = line[pos..].split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+#[cfg(windows)]
+fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
+    // StartMenuInternet is the Windows registration point used by desktop browsers. Read both
+    // machine-wide and per-user registrations, including 32-bit registrations on 64-bit Windows.
+    let roots = [
+        r"HKCU\Software\Clients\StartMenuInternet",
+        r"HKLM\Software\Clients\StartMenuInternet",
+        r"HKLM\Software\WOW6432Node\Clients\StartMenuInternet",
+    ];
+    let mut found = Vec::new();
+    for root in roots {
+        let Ok(output) = crate::sys::cmd("reg").args(["query", root]).output() else { continue };
+        if !output.status.success() {
+            continue;
+        }
+        let prefix = format!("{root}\\");
+        let prefix_lower = prefix.to_ascii_lowercase();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let key = line.trim();
+            let key_lower = key.to_ascii_lowercase();
+            if !key_lower.starts_with(&prefix_lower) {
+                continue;
+            }
+            let child = &key[prefix.len()..];
+            if child.is_empty() || child.contains('\\') {
+                continue;
+            }
+            if found.iter().any(|entry: &WindowsBrowserRegistration| entry.key.eq_ignore_ascii_case(child)) {
+                continue;
+            }
+            let name = crate::sys::cmd("reg")
+                .args(["query", key, "/ve"])
+                .output()
+                .ok()
+                .filter(|result| result.status.success())
+                .and_then(|result| registry_string_value(&String::from_utf8_lossy(&result.stdout).to_string()))
+                .unwrap_or_else(|| child.to_string());
+            found.push(WindowsBrowserRegistration { key: child.to_string(), name });
+        }
+    }
+    found
+}
+
+#[cfg(windows)]
+fn windows_default_browser_hint() -> Option<String> {
+    let output = crate::sys::cmd("reg")
+        .args(["query", r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice", "/v", "ProgId"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    registry_string_value(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(windows)]
+fn normalized_browser_text(value: &str) -> String {
+    value.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+#[cfg(windows)]
+fn is_sqlite_database(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut header = [0u8; 16];
+    std::io::Read::read_exact(&mut file, &mut header).is_ok() && header == *b"SQLite format 3\0"
+}
+
+#[cfg(windows)]
+fn scan_cookie_profiles(
+    directory: &Path,
+    depth: usize,
+    budget: &mut usize,
+    found: &mut Vec<DetectedCookieProfile>,
+) {
+    // Stay inside the two per-user application-data roots, limit traversal cost, and skip
+    // cache-heavy folders. Only cookie database files are inspected; cookie contents are never read here.
+    if depth > 10 || *budget == 0 || found.len() >= 128 {
+        return;
+    }
+    *budget -= 1;
+    let Ok(entries) = std::fs::read_dir(directory) else { return };
+    for entry in entries.flatten() {
+        if found.len() >= 128 || *budget == 0 {
+            break;
+        }
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_file() {
+            let filename = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            let family = match filename.as_str() {
+                // Firefox-family browsers store their cookie database as cookies.sqlite.
+                "cookies.sqlite" => Some("firefox"),
+                // Chromium-family browsers use a Cookies SQLite database, usually under Network/.
+                "cookies" => Some("chromium"),
+                _ => None,
+            };
+            let Some(family) = family else { continue };
+            if !is_sqlite_database(&path) {
+                continue;
+            }
+            let Some(parent) = path.parent() else { continue };
+            let profile_dir = if family == "chromium" && parent.file_name().map(|n| n.to_string_lossy().eq_ignore_ascii_case("Network")).unwrap_or(false) {
+                let Some(profile) = parent.parent() else { continue };
+                profile.to_path_buf()
+            } else {
+                parent.to_path_buf()
+            };
+            if !found.iter().any(|profile| profile.profile_dir == profile_dir) {
+                found.push(DetectedCookieProfile { family, profile_dir });
+            }
+        } else if kind.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if matches!(name.as_str(),
+                "cache" | "code cache" | "gpucache" | "shadercache" | "crashpad" |
+                "temp" | "logs" | "dawncache" | "service worker" | "application cache" |
+                "crash reports" | "node_modules"
+            ) {
+                continue;
+            }
+            scan_cookie_profiles(&path, depth + 1, budget, found);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn profile_registration_name(profile: &Path, registrations: &[WindowsBrowserRegistration]) -> Option<String> {
+    let path = normalized_browser_text(&profile.to_string_lossy());
+    registrations.iter().find_map(|registration| {
+        let display = normalized_browser_text(&registration.name);
+        let key = normalized_browser_text(&registration.key);
+        if (display.len() >= 4 && path.contains(&display)) || (key.len() >= 4 && path.contains(&key)) {
+            Some(registration.name.clone())
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(windows)]
+fn profile_folder_label(profile: &Path) -> String {
+    profile.file_name().map(|n| n.to_string_lossy().into_owned()).filter(|n| !n.is_empty()).unwrap_or_else(|| "Profile".into())
+}
+
+#[cfg(windows)]
+fn detect_installed() -> Vec<BrowserChoice> {
+    let home = dirs::home_dir().unwrap_or_default();
+    let local = dirs::data_local_dir().unwrap_or_default();
+    let roaming = dirs::data_dir().unwrap_or_default();
+    let registrations = windows_registered_browsers();
+    let mut profiles = Vec::new();
+    let mut budget = 30_000usize;
+    for root in [local, roaming] {
+        if root.exists() {
+            scan_cookie_profiles(&root, 0, &mut budget, &mut profiles);
+        }
+    }
+
+    let mut choices = Vec::new();
+    for profile in profiles {
+        let Ok(relative) = profile.profile_dir.strip_prefix(&home) else { continue };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let id = format!("{}|{}", profile.family, relative);
+        let registered_name = profile_registration_name(&profile.profile_dir, &registrations);
+        let inferred_name = profile.profile_dir
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| if profile.family == "firefox" { "Firefox".into() } else { "Chromium".into() });
+        let browser_name = registered_name.unwrap_or(inferred_name);
+        let label = format!("{browser_name} — {}", profile_folder_label(&profile.profile_dir));
+        choices.push(BrowserChoice { id, label });
+    }
+    choices.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    choices
+}
+
+#[cfg(windows)]
+fn windows_default_browser(installed: &[BrowserChoice]) -> Option<String> {
+    let hint = windows_default_browser_hint()?;
+    let hint_normalized = normalized_browser_text(&hint);
+    if hint_normalized.is_empty() {
+        return None;
+    }
+    if let Some(choice) = installed.iter().find(|choice| {
+        let label = normalized_browser_text(&choice.label);
+        let id = normalized_browser_text(&choice.id);
+        label.contains(&hint_normalized) || hint_normalized.contains(&label) ||
+            id.contains(&hint_normalized) || hint_normalized.contains(&id)
+    }) {
+        return Some(choice.id.clone());
+    }
+    // Known ProgIds still give us a useful product hint, but the actual extraction family comes
+    // from the cookie database format discovered above.
+    let known = crate::sys::browser_from_text(&hint)?;
+    let product = normalized_browser_text(known);
+    installed.iter()
+        .find(|choice| normalized_browser_text(&choice.label).contains(&product))
+        .or_else(|| {
+            let family = browser_family(known);
+            installed.iter().find(|choice| browser_family(&choice.id) == family)
+        })
+        .map(|choice| choice.id.clone())
+}
+
+fn browser_family(browser: &str) -> &str {
+    browser.split_once('|').map(|(family, _)| family).unwrap_or(browser)
+}
+
+/// Convert a selected profile ID into yt-dlp's browser specification and working directory.
+/// Relative profile paths avoid the drive-letter colon being mistaken for yt-dlp's profile separator.
+pub fn browser_spec(browser: &str) -> (String, Option<PathBuf>) {
+    if let Some((family, profile)) = browser.split_once('|') {
+        if matches!(family, "firefox" | "chromium") && !profile.is_empty() {
+            return (format!("{family}:{profile}"), dirs::home_dir());
+        }
+    }
+    (browser.to_string(), None)
+}
+
+fn known_browser_label(name: &str) -> &'static str {
     match name {
         "chrome" => "Google Chrome",
         "chromium" => "Chromium",
@@ -246,11 +499,24 @@ pub fn browser_label(name: &str) -> &'static str {
     }
 }
 
+/// A friendly name for a browser or one of the detected profiles.
+pub fn browser_label(name: &str) -> String {
+    if let Some(choice) = browsers().installed.iter().find(|choice| choice.id == name) {
+        return choice.label.clone();
+    }
+    match browser_family(name) {
+        "firefox" if name.contains('|') => "Firefox-compatible profile".into(),
+        "chromium" if name.contains('|') => "Chromium-based profile".into(),
+        family => known_browser_label(family).to_string(),
+    }
+}
+
 /// Words that help when reading the sign-in from a browser fails, by what went wrong.
 pub fn browser_help(browser: &str, raw: &str) -> String {
     let name = browser_label(browser);
+    let family = browser_family(browser);
     let low = raw.to_lowercase();
-    let chromium_family = matches!(browser, "chrome" | "edge" | "brave" | "vivaldi" | "opera" | "chromium");
+    let chromium_family = matches!(family, "chrome" | "edge" | "brave" | "vivaldi" | "opera" | "chromium");
     if low.contains("could not copy") || low.contains("database is locked") || low.contains("permission denied") || low.contains("being used by another process") {
         return format!("{name} is still open and keeps its sign-in locked. Close {name} completely (also from the tray icon near the clock) and press Connect again.");
     }
@@ -290,6 +556,7 @@ fn js_runtimes() -> &'static Vec<&'static str> {
 struct Login {
     args: Vec<String>,
     temp: Option<PathBuf>,
+    current_dir: Option<PathBuf>,
 }
 
 impl Drop for Login {
@@ -313,7 +580,7 @@ fn login() -> Option<Login> {
                     use std::os::unix::fs::PermissionsExt;
                     let _ = std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600));
                 }
-                return Some(Login { args: vec!["--cookies".into(), copy.to_string_lossy().into_owned()], temp: Some(copy) });
+                return Some(Login { args: vec!["--cookies".into(), copy.to_string_lossy().into_owned()], temp: Some(copy), current_dir: None });
             }
         }
     }
@@ -321,7 +588,10 @@ fn login() -> Option<Login> {
     if browser.is_empty() {
         None
     } else {
-        Some(Login { args: vec!["--cookies-from-browser".into(), browser], temp: None })
+        {
+        let (spec, current_dir) = browser_spec(&browser);
+        Some(Login { args: vec!["--cookies-from-browser".into(), spec], temp: None, current_dir })
+    }
     }
 }
 
@@ -394,6 +664,9 @@ fn run_ytdlp_once(bin: &Path, url: &str, quality: Quality, out_template: &str, w
     }
     let _login = if with_cookies { login() } else { None };
     if let Some(l) = &_login {
+        if let Some(directory) = &l.current_dir {
+            cmd.current_dir(directory);
+        }
         cmd.args(&l.args);
     }
     let out = cmd
@@ -432,6 +705,9 @@ fn attempt_direct(bin: &Path, page_url: &str, format: &str, cookies: bool, js: b
     }
     let _login = if cookies { login() } else { None };
     if let Some(l) = &_login {
+        if let Some(directory) = &l.current_dir {
+            cmd.current_dir(directory);
+        }
         cmd.args(&l.args);
     }
     let out = cmd
@@ -602,6 +878,9 @@ fn attempt_lines(bin: &Path, page_url: &str, format: &str, cookies: bool, js: bo
     }
     let _login = if cookies { login() } else { None };
     if let Some(l) = &_login {
+        if let Some(directory) = &l.current_dir {
+            cmd.current_dir(directory);
+        }
         cmd.args(&l.args);
     }
     let out = cmd
