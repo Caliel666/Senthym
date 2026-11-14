@@ -313,7 +313,8 @@ fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
 
             let mut in_url_associations = false;
             let mut application_name = None;
-            let mut program_ids = Vec::new();
+            let mut http_prog_id = None;
+            let mut https_prog_id = None;
             for line in String::from_utf8_lossy(&capabilities.stdout).lines() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("HKEY_") {
@@ -323,40 +324,26 @@ fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
                 for (value_name, value) in registry_values(trimmed) {
                     if !in_url_associations && value_name.eq_ignore_ascii_case("ApplicationName") {
                         application_name = Some(value);
-                    } else if in_url_associations
-                        && (value_name.eq_ignore_ascii_case("http") || value_name.eq_ignore_ascii_case("https"))
-                    {
-                        if !program_ids.iter().any(|existing: &String| existing.eq_ignore_ascii_case(&value)) {
-                            program_ids.push(value);
-                        }
+                    } else if in_url_associations && value_name.eq_ignore_ascii_case("http") {
+                        http_prog_id = Some(value);
+                    } else if in_url_associations && value_name.eq_ignore_ascii_case("https") {
+                        https_prog_id = Some(value);
                     }
                 }
             }
-            let has_http_https = {
-                let mut has_http = false;
-                let mut has_https = false;
-                for line in String::from_utf8_lossy(&capabilities.stdout).lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("HKEY_") {
-                        in_url_associations = trimmed.to_ascii_lowercase().ends_with("\\urlassociations");
-                        continue;
-                    }
-                    if in_url_associations {
-                        if let Some((name, _)) = registry_values(trimmed).first() {
-                            has_http |= name.eq_ignore_ascii_case("http");
-                            has_https |= name.eq_ignore_ascii_case("https");
-                        }
-                    }
-                }
-                has_http && has_https
-            };
-            if !has_http_https || program_ids.is_empty() {
+            // Requiring both protocols is the important distinction between a real browser and
+            // an application that happens to ship WebView2/CEF.
+            let (Some(http_prog_id), Some(https_prog_id)) = (http_prog_id, https_prog_id) else {
                 continue;
+            };
+            let mut program_ids = vec![http_prog_id];
+            if !program_ids[0].eq_ignore_ascii_case(&https_prog_id) {
+                program_ids.push(https_prog_id);
             }
             let name = application_name.unwrap_or(registered_name);
             if found.iter().any(|entry| {
                 entry.name.eq_ignore_ascii_case(&name)
-                    || entry.program_ids.iter().any(|old| program_ids.iter().any(|new| old.eq_ignore_ascii_case(new)))
+                    && entry.capability_path.eq_ignore_ascii_case(&capabilities_path)
             }) {
                 continue;
             }
@@ -414,7 +401,7 @@ fn browser_identity_aliases(registration: &WindowsBrowserRegistration) -> Vec<St
     // ProgIds such as ZenHTML and FirefoxURL-<suffix> identify the registered browser even
     // when the display name is localized or generic.
     for program_id in &registration.program_ids {
-        let first = program_id.split(['-', '.']).next().unwrap_or(program_id);
+        let first = program_id.split(|c: char| c == '-' || c == '.').next().unwrap_or(program_id);
         let mut product = first.to_string();
         for suffix in ["html", "htm", "url", "uri"] {
             if product.to_ascii_lowercase().ends_with(suffix) && product.len() > suffix.len() + 2 {
@@ -1345,6 +1332,34 @@ mod browser_tests {
     fn detected_profile_paths_are_passed_to_ytdlp_without_drive_letter_ambiguity() {
         let (spec, _) = browser_spec("chromium|AppData/Local/ExampleBrowser/User Data/Default");
         assert_eq!(spec, "chromium:AppData/Local/ExampleBrowser/User Data/Default");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zen_is_discovered_from_its_registered_identity_not_webview_folders() {
+        use super::{browser_identity_aliases, is_browser_identity_path, WindowsBrowserRegistration};
+        let zen = WindowsBrowserRegistration {
+            name: "Zen Browser".into(),
+            capability_path: r"Software\\Clients\\StartMenuInternet\\Zen\\Capabilities".into(),
+            program_ids: vec!["ZenHTML".into()],
+        };
+        let aliases = browser_identity_aliases(&zen);
+        assert!(is_browser_identity_path("zen", &aliases));
+        assert!(!is_browser_identity_path("SomeApp\\WebView2", &aliases));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registered_chromium_data_roots_match_vendor_and_product_path() {
+        use super::{browser_identity_aliases, is_browser_identity_path, WindowsBrowserRegistration};
+        let chrome = WindowsBrowserRegistration {
+            name: "Google Chrome".into(),
+            capability_path: r"Software\\Clients\\StartMenuInternet\\Google Chrome\\Capabilities".into(),
+            program_ids: vec!["ChromeHTML".into()],
+        };
+        let aliases = browser_identity_aliases(&chrome);
+        assert!(is_browser_identity_path("Google\\Chrome", &aliases));
+        assert!(!is_browser_identity_path("Google\\SomeWebView", &aliases));
     }
 
     #[test]
