@@ -3,6 +3,7 @@ name: Build Senthym
 on:
   workflow_dispatch:
   push:
+    branches: ["feature/windows-browser-profile-detection"]
     tags: ["v*", "[0-9]*"]
 
 jobs:
@@ -91,7 +92,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # objc2 0.4.1 (via winit 0.29) fails to compile with Rust 1.100.0.
+      # Keep the macOS packaging job on the last working stable until that dependency is updated.
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
