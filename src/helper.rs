@@ -418,7 +418,13 @@ fn browser_identity_aliases(registration: &WindowsBrowserRegistration) -> Vec<St
 #[cfg(windows)]
 fn is_browser_identity_path(relative: &str, aliases: &[String]) -> bool {
     let normalized = normalized_browser_text(relative);
-    aliases.iter().any(|alias| {
+    let component_match = relative
+        .split(|c| c == '\\' || c == '/')
+        .any(|part| {
+            let part = normalized_browser_text(part);
+            aliases.iter().any(|alias| part == *alias || part.starts_with(alias))
+        });
+    component_match || aliases.iter().any(|alias| {
         normalized == *alias
             || normalized.ends_with(alias)
             || normalized.ends_with(&format!("{alias}browser"))
@@ -427,12 +433,13 @@ fn is_browser_identity_path(relative: &str, aliases: &[String]) -> bool {
 
 #[cfg(windows)]
 fn skip_browser_data_directory(name: &str) -> bool {
-    matches!(name.to_ascii_lowercase().as_str(),
+    let name = name.to_ascii_lowercase();
+    matches!(name.as_str(),
         "cache" | "code cache" | "gpucache" | "shadercache" | "crashpad" |
         "temp" | "logs" | "dawncache" | "service worker" | "application cache" |
         "crash reports" | "node_modules" | "packages" | "webview" | "webview2" | "cef" |
         "embeddedbrowser" | "embedded browser" | "edgewebview"
-    )
+    ) || name.starts_with("edgewebview") || name.starts_with("chromewebview") || name.starts_with("webview")
 }
 
 #[cfg(windows)]
