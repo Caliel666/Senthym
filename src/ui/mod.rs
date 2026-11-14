@@ -1408,19 +1408,22 @@ fn toasts(ctx: &egui::Context, app: &mut App) {
 /// true when the person picked another one.
 pub fn browser_picker(ui: &mut egui::Ui, id: &str, width: f32, pick: &mut String) -> bool {
     let found = crate::helper::browsers();
-    // What is offered: what was found. When nothing was found, every known browser, so the list is never empty.
-    let mut offered: Vec<&'static str> = if found.installed.is_empty() { crate::helper::KNOWN_BROWSERS.to_vec() } else { found.installed.clone() };
-    // A browser chosen earlier stays in the list even if it can't be found now.
-    if let Some(k) = crate::helper::KNOWN_BROWSERS.iter().find(|k| **k == pick.as_str()) {
-        if !offered.contains(k) {
-            offered.push(k);
-        }
+    // Prefer detected cookie profiles. If none are available, offer the generic engine families
+    // (or the saved choice) rather than assuming a particular browser vendor.
+    let mut offered: Vec<String> = if found.installed.is_empty() {
+        crate::helper::KNOWN_BROWSERS.iter().map(|name| name.to_string()).collect()
+    } else {
+        found.installed.iter().map(|choice| choice.id.clone()).collect()
+    };
+    // Preserve a previously selected profile even if it is no longer present.
+    if !pick.is_empty() && !offered.iter().any(|name| name == pick) {
+        offered.push(pick.clone());
     }
     let label = |name: &str| {
-        let mut l = crate::helper::browser_label(name).to_string();
-        if found.default == Some(name) {
+        let mut l = crate::helper::browser_label(name);
+        if found.default.as_deref() == Some(name) {
             l.push_str(" (default)");
-        } else if !found.installed.is_empty() && !found.installed.contains(&name) {
+        } else if !found.installed.is_empty() && !found.installed.iter().any(|choice| choice.id == name) {
             l.push_str(" (not found)");
         }
         l
@@ -1434,12 +1437,11 @@ pub fn browser_picker(ui: &mut egui::Ui, id: &str, width: f32, pick: &mut String
     }
     egui::ComboBox::from_id_source(id).selected_text(shown).width(width).show_ui(ui, |ui| {
         for name in offered {
-            ui.selectable_value(pick, name.to_string(), label(name));
+            ui.selectable_value(pick, name.clone(), label(&name));
         }
     });
     *pick != before
 }
-
 fn welcome(ctx: &egui::Context, app: &mut App) {
     use spotify_pages::SPOTIFY_GREEN;
     let screen = ctx.screen_rect();
