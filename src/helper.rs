@@ -342,7 +342,7 @@ fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
             if !program_ids[0].eq_ignore_ascii_case(&https_prog_id) {
                 program_ids.push(https_prog_id);
             }
-            let name = application_name.unwrap_or(registered_name);
+            let name = application_name.unwrap_or_else(|| registered_name.clone());
             if found.iter().any(|entry| entry.identity.eq_ignore_ascii_case(&registered_name)) {
                 continue;
             }
