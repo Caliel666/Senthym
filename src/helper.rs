@@ -398,19 +398,8 @@ fn browser_identity_aliases(registration: &WindowsBrowserRegistration) -> Vec<St
         add(product_key);
     }
 
-    // ProgIds such as ZenHTML and FirefoxURL-<suffix> identify the registered browser even
-    // when the display name is localized or generic.
-    for program_id in &registration.program_ids {
-        let first = program_id.split(|c: char| c == '-' || c == '.').next().unwrap_or(program_id);
-        let mut product = first.to_string();
-        for suffix in ["html", "htm", "url", "uri"] {
-            if product.to_ascii_lowercase().ends_with(suffix) && product.len() > suffix.len() + 2 {
-                product.truncate(product.len() - suffix.len());
-                break;
-            }
-        }
-        add(&product);
-    }
+    // Do not use ProgID text as a profile-directory alias: Firefox forks such as Zen can
+    // deliberately reuse Firefox's URL ProgIDs while keeping their profiles in a separate folder.
 
     let mut tokens: Vec<String> = registration.name
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -444,7 +433,7 @@ fn skip_browser_data_directory(name: &str) -> bool {
     matches!(name.to_ascii_lowercase().as_str(),
         "cache" | "code cache" | "gpucache" | "shadercache" | "crashpad" |
         "temp" | "logs" | "dawncache" | "service worker" | "application cache" |
-        "crash reports" | "node_modules" | "webview" | "webview2" | "cef" |
+        "crash reports" | "node_modules" | "packages" | "webview" | "webview2" | "cef" |
         "embeddedbrowser" | "embedded browser" | "edgewebview"
     )
 }
@@ -1340,11 +1329,12 @@ mod browser_tests {
         use super::{browser_identity_aliases, is_browser_identity_path, WindowsBrowserRegistration};
         let zen = WindowsBrowserRegistration {
             name: "Zen Browser".into(),
-            capability_path: r"Software\\Clients\\StartMenuInternet\\Zen\\Capabilities".into(),
+            capability_path: r"Software\Clients\StartMenuInternet\Zen\Capabilities".into(),
             program_ids: vec!["ZenHTML".into()],
         };
         let aliases = browser_identity_aliases(&zen);
         assert!(is_browser_identity_path("zen", &aliases));
+        assert!(!is_browser_identity_path("Mozilla\\Firefox", &aliases));
         assert!(!is_browser_identity_path("SomeApp\\WebView2", &aliases));
     }
 
@@ -1354,7 +1344,7 @@ mod browser_tests {
         use super::{browser_identity_aliases, is_browser_identity_path, WindowsBrowserRegistration};
         let chrome = WindowsBrowserRegistration {
             name: "Google Chrome".into(),
-            capability_path: r"Software\\Clients\\StartMenuInternet\\Google Chrome\\Capabilities".into(),
+            capability_path: r"Software\Clients\StartMenuInternet\Google Chrome\Capabilities".into(),
             program_ids: vec!["ChromeHTML".into()],
         };
         let aliases = browser_identity_aliases(&chrome);
