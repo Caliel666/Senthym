@@ -554,6 +554,99 @@ fn scan_cookie_profiles(
 }
 
 #[cfg(windows)]
+fn firefox_profile_browser_name(profiles_directory: &Path) -> String {
+    let product = profiles_directory
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Firefox".to_string());
+    if product.eq_ignore_ascii_case("firefox") || product.eq_ignore_ascii_case("mozilla") {
+        "Firefox".to_string()
+    } else if product.eq_ignore_ascii_case("zen") {
+        "Zen".to_string()
+    } else {
+        product
+    }
+}
+
+#[cfg(windows)]
+fn is_firefox_cookie_profile(directory: &Path) -> bool {
+    // Gecko browsers share a profile format, even when they do not register themselves as
+    // Windows default-browser candidates. Requiring the cookie DB plus profile metadata keeps
+    // arbitrary cookies.sqlite files and embedded browser caches out of the picker.
+    directory.join("prefs.js").is_file()
+        && (directory.join("places.sqlite").is_file()
+            || directory.join("compatibility.ini").is_file())
+        && is_sqlite_database(&directory.join("cookies.sqlite"))
+}
+
+#[cfg(windows)]
+fn firefox_cookie_profile_modified(directory: &Path) -> u64 {
+    std::fs::metadata(directory.join("cookies.sqlite"))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn scan_firefox_profiles(
+    directory: &Path,
+    depth: usize,
+    budget: &mut usize,
+    found: &mut Vec<DetectedCookieProfile>,
+) {
+    if depth > 8 || *budget == 0 || found.len() >= 128 {
+        return;
+    }
+    *budget -= 1;
+    let Ok(entries) = std::fs::read_dir(directory) else { return };
+    for entry in entries.flatten() {
+        if *budget == 0 || found.len() >= 128 {
+            break;
+        }
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        if !kind.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if skip_browser_data_directory(&name) {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("profiles") {
+            let browser_name = firefox_profile_browser_name(&path);
+            let Ok(profile_entries) = std::fs::read_dir(&path) else { continue };
+            for profile_entry in profile_entries.flatten() {
+                if found.len() >= 128 {
+                    break;
+                }
+                let profile_path = profile_entry.path();
+                if !profile_entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
+                    || !is_firefox_cookie_profile(&profile_path)
+                {
+                    continue;
+                }
+                if !found.iter().any(|profile| profile.profile_dir == profile_path) {
+                    found.push(DetectedCookieProfile {
+                        family: "firefox",
+                        profile_dir: profile_path.clone(),
+                        modified_secs: firefox_cookie_profile_modified(&profile_path),
+                        browser_name: browser_name.clone(),
+                        program_ids: Vec::new(),
+                    });
+                }
+            }
+            continue;
+        }
+        scan_firefox_profiles(&path, depth + 1, budget, found);
+    }
+}
+
+#[cfg(windows)]
 fn detect_installed() -> Vec<BrowserChoice> {
     let home = dirs::home_dir().unwrap_or_default();
     let appdata_roots = [
@@ -563,6 +656,8 @@ fn detect_installed() -> Vec<BrowserChoice> {
     let registrations = windows_registered_browsers();
     let mut profiles = Vec::new();
 
+    // First, use Windows browser registrations to find product-specific Chromium roots.
+    // This avoids treating every embedded Chromium/WebView cookie store as an installed browser.
     for registration in &registrations {
         let aliases = browser_identity_aliases(registration);
         if aliases.is_empty() {
@@ -594,6 +689,17 @@ fn detect_installed() -> Vec<BrowserChoice> {
                 );
             }
         }
+    }
+
+    // Firefox and Firefox-derived browsers use the same identifiable on-disk profile format.
+    // Discover these profiles independently of RegisteredApplications: Firefox/Zen installers
+    // do not consistently publish Default Programs capabilities on every Windows installation.
+    for appdata in &appdata_roots {
+        if !appdata.exists() {
+            continue;
+        }
+        let mut profile_budget = 20_000usize;
+        scan_firefox_profiles(appdata, 0, &mut profile_budget, &mut profiles);
     }
 
     // Prefer the most recently used profile when several profiles belong to one browser.
@@ -1322,6 +1428,34 @@ mod browser_tests {
     fn detected_profile_paths_are_passed_to_ytdlp_without_drive_letter_ambiguity() {
         let (spec, _) = browser_spec("chromium|AppData/Local/ExampleBrowser/User Data/Default");
         assert_eq!(spec, "chromium:AppData/Local/ExampleBrowser/User Data/Default");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn firefox_family_profiles_are_detected_without_default_program_registration() {
+        use super::{firefox_profile_browser_name, is_firefox_cookie_profile};
+        use std::path::Path;
+
+        assert_eq!(
+            firefox_profile_browser_name(Path::new(r"C:\Users\Test\AppData\Local\zen\Profiles")),
+            "Zen"
+        );
+        assert_eq!(
+            firefox_profile_browser_name(Path::new(r"C:\Users\Test\AppData\Roaming\Mozilla\Firefox\Profiles")),
+            "Firefox"
+        );
+
+        let profile = std::env::temp_dir().join(format!(
+            "senthym-firefox-profile-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&profile);
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("prefs.js"), b"// profile prefs").unwrap();
+        std::fs::write(profile.join("places.sqlite"), b"not needed for signature test").unwrap();
+        std::fs::write(profile.join("cookies.sqlite"), b"SQLite format 3\0").unwrap();
+        assert!(is_firefox_cookie_profile(&profile));
+        let _ = std::fs::remove_dir_all(&profile);
     }
 
     #[cfg(windows)]
