@@ -418,13 +418,10 @@ fn browser_identity_aliases(registration: &WindowsBrowserRegistration) -> Vec<St
 #[cfg(windows)]
 fn is_browser_identity_path(relative: &str, aliases: &[String]) -> bool {
     let normalized = normalized_browser_text(relative);
-    let component_match = relative
-        .split(|c| c == '\\' || c == '/')
-        .any(|part| {
-            let part = normalized_browser_text(part);
-            aliases.iter().any(|alias| part == *alias || part.starts_with(alias))
-        });
-    component_match || aliases.iter().any(|alias| {
+    let leaf = relative.rsplit(|c| c == '\\' || c == '/').next().unwrap_or(relative);
+    let leaf = normalized_browser_text(leaf);
+    let leaf_match = aliases.iter().any(|alias| leaf == *alias || leaf.starts_with(alias));
+    leaf_match || aliases.iter().any(|alias| {
         normalized == *alias
             || normalized.ends_with(alias)
             || normalized.ends_with(&format!("{alias}browser"))
