@@ -159,7 +159,7 @@ pub const KNOWN_BROWSERS: &[&str] = &["safari", "chrome", "firefox", "edge", "br
 #[cfg(all(not(windows), not(target_os = "macos")))]
 pub const KNOWN_BROWSERS: &[&str] = &["chrome", "edge", "firefox", "brave", "vivaldi", "opera", "chromium"];
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BrowserChoice {
     /// Stable setting value. Windows profile choices encode the detected engine and a path
     /// relative to the user's home directory, so drive letters never collide with yt-dlp's
@@ -360,7 +360,7 @@ fn scan_cookie_profiles(
         let path = entry.path();
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_file() {
-            let filename = entry.file_name().to_string_lossy();
+            let filename = entry.file_name().to_string_lossy().into_owned();
             let family = cookie_database_family(&filename);
             let Some(family) = family else { continue };
             if !is_sqlite_database(&path) {
