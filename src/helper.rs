@@ -244,8 +244,10 @@ fn detect_installed() -> Vec<BrowserChoice> {
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 struct WindowsBrowserRegistration {
+    /// The value name under RegisteredApplications; this is the stable app identity.
+    identity: String,
+    /// Friendly product name from Capabilities\\ApplicationName.
     name: String,
-    capability_path: String,
     program_ids: Vec<String>,
 }
 
@@ -341,15 +343,12 @@ fn windows_registered_browsers() -> Vec<WindowsBrowserRegistration> {
                 program_ids.push(https_prog_id);
             }
             let name = application_name.unwrap_or(registered_name);
-            if found.iter().any(|entry| {
-                entry.name.eq_ignore_ascii_case(&name)
-                    && entry.capability_path.eq_ignore_ascii_case(&capabilities_path)
-            }) {
+            if found.iter().any(|entry| entry.identity.eq_ignore_ascii_case(&registered_name)) {
                 continue;
             }
             found.push(WindowsBrowserRegistration {
+                identity: registered_name,
                 name,
-                capability_path: capabilities_path,
                 program_ids,
             });
         }
@@ -380,28 +379,19 @@ fn normalized_browser_text(value: &str) -> String {
 #[cfg(windows)]
 fn browser_identity_aliases(registration: &WindowsBrowserRegistration) -> Vec<String> {
     let mut aliases = Vec::new();
+    let identity = &registration.identity;
     let mut add = |value: &str| {
         let normalized = normalized_browser_text(value);
         if normalized.len() >= 3 && !aliases.iter().any(|existing: &String| existing == &normalized) {
             aliases.push(normalized);
         }
     };
-    add(&registration.name);
+    add(identity);
 
-    // Browser capabilities paths usually contain the product's registry key (for example,
-    // ...\Clients\StartMenuInternet\Zen\Capabilities).
-    if let Some(product_key) = registration.capability_path
-        .split('\\')
-        .rev()
-        .find(|part| !part.eq_ignore_ascii_case("Capabilities"))
-    {
-        add(product_key);
-    }
-
-    // Do not use ProgID text as a profile-directory alias: Firefox forks such as Zen can
-    // deliberately reuse Firefox's URL ProgIDs while keeping their profiles in a separate folder.
-
-    let mut tokens: Vec<String> = registration.name
+    // RegisteredApplications values are product identities (e.g. "Google Chrome",
+    // "Zen Browser", or "org.mozilla.firefox"). Normalize their meaningful components so
+    // product-specific AppData paths can be matched without scanning unrelated app data.
+    let tokens: Vec<String> = identity
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|part| {
             let lower = part.to_ascii_lowercase();
@@ -412,8 +402,15 @@ fn browser_identity_aliases(registration: &WindowsBrowserRegistration) -> Vec<St
     if tokens.len() > 1 {
         add(&tokens.join(""));
     }
-    if let Some(last) = tokens.pop() {
-        add(&last);
+    if let Some(last) = tokens.last() {
+        add(last);
+    }
+    // Some installers use a single camel-cased key such as "ZenBrowser".
+    let compact = normalized_browser_text(identity);
+    for suffix in ["browser", "internet"] {
+        if compact.ends_with(suffix) && compact.len() > suffix.len() + 2 {
+            add(&compact[..compact.len() - suffix.len()]);
+        }
     }
     aliases
 }
@@ -1328,9 +1325,9 @@ mod browser_tests {
     fn zen_is_discovered_from_its_registered_identity_not_webview_folders() {
         use super::{browser_identity_aliases, is_browser_identity_path, WindowsBrowserRegistration};
         let zen = WindowsBrowserRegistration {
+            identity: "Zen Browser".into(),
             name: "Zen Browser".into(),
-            capability_path: r"Software\Clients\StartMenuInternet\Zen\Capabilities".into(),
-            program_ids: vec!["ZenHTML".into()],
+            program_ids: vec!["FirefoxURL".into()],
         };
         let aliases = browser_identity_aliases(&zen);
         assert!(is_browser_identity_path("zen", &aliases));
@@ -1343,8 +1340,8 @@ mod browser_tests {
     fn registered_chromium_data_roots_match_vendor_and_product_path() {
         use super::{browser_identity_aliases, is_browser_identity_path, WindowsBrowserRegistration};
         let chrome = WindowsBrowserRegistration {
+            identity: "Google Chrome".into(),
             name: "Google Chrome".into(),
-            capability_path: r"Software\Clients\StartMenuInternet\Google Chrome\Capabilities".into(),
             program_ids: vec!["ChromeHTML".into()],
         };
         let aliases = browser_identity_aliases(&chrome);
