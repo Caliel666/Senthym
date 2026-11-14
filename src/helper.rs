@@ -250,6 +250,7 @@ struct WindowsBrowserRegistration {
 struct DetectedCookieProfile {
     family: &'static str,
     profile_dir: PathBuf,
+    modified_secs: u64,
 }
 
 #[cfg(windows)]
@@ -347,13 +348,13 @@ fn scan_cookie_profiles(
 ) {
     // Stay inside the two per-user application-data roots, limit traversal cost, and skip
     // cache-heavy folders. Only cookie database files are inspected; cookie contents are never read here.
-    if depth > 10 || *budget == 0 || found.len() >= 128 {
+    if depth > 10 || *budget == 0 || found.len() >= 512 {
         return;
     }
     *budget -= 1;
     let Ok(entries) = std::fs::read_dir(directory) else { return };
     for entry in entries.flatten() {
-        if found.len() >= 128 || *budget == 0 {
+        if found.len() >= 512 || *budget == 0 {
             break;
         }
         let path = entry.path();
@@ -373,7 +374,13 @@ fn scan_cookie_profiles(
                 parent.to_path_buf()
             };
             if !found.iter().any(|profile| profile.profile_dir == profile_dir) {
-                found.push(DetectedCookieProfile { family, profile_dir });
+                let modified_secs = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0);
+                found.push(DetectedCookieProfile { family, profile_dir, modified_secs });
             }
         } else if kind.is_dir() {
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
@@ -423,6 +430,8 @@ fn detect_installed() -> Vec<BrowserChoice> {
             scan_cookie_profiles(&root, 0, &mut budget, &mut profiles);
         }
     }
+    // Put the most recently used profiles first, matching yt-dlp's own profile preference.
+    profiles.sort_by(|a, b| b.modified_secs.cmp(&a.modified_secs));
 
     let mut choices = Vec::new();
     for profile in profiles {
@@ -444,7 +453,6 @@ fn detect_installed() -> Vec<BrowserChoice> {
         let label = format!("{browser_name} — {}", profile_folder_label(&profile.profile_dir));
         choices.push(BrowserChoice { id, label });
     }
-    choices.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
     choices
 }
 
@@ -520,8 +528,10 @@ fn known_browser_label(name: &str) -> &'static str {
 
 /// A friendly name for a browser or one of the detected profiles.
 pub fn browser_label(name: &str) -> String {
-    if let Some(choice) = browsers().installed.iter().find(|choice| choice.id == name) {
-        return choice.label.clone();
+    if name.contains('|') {
+        if let Some(choice) = browsers().installed.iter().find(|choice| choice.id == name) {
+            return choice.label.clone();
+        }
     }
     match browser_family(name) {
         "firefox" if name.contains('|') => "Firefox-compatible profile".into(),
