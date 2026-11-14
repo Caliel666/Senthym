@@ -388,8 +388,7 @@ fn browser_identity_aliases(registration: &WindowsBrowserRegistration) -> Vec<St
     };
     add(identity);
 
-    // RegisteredApplications values are product identities (e.g. "Google Chrome",
-    // "Zen Browser", or "org.mozilla.firefox"). Normalize their meaningful components so
+    // RegisteredApplications values are product identities. Normalize their meaningful components so
     // product-specific AppData paths can be matched without scanning unrelated app data.
     let tokens: Vec<String> = identity
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -554,27 +553,34 @@ fn scan_cookie_profiles(
 }
 
 #[cfg(windows)]
-fn firefox_profile_browser_name(profiles_directory: &Path) -> String {
+fn cookie_profile_product_label(profiles_directory: &Path) -> String {
+    // Derive the display name from the discovered product-data directory, not a vendor list.
     let product = profiles_directory
         .parent()
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().trim().to_string())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "Firefox".to_string());
-    if product.eq_ignore_ascii_case("firefox") || product.eq_ignore_ascii_case("mozilla") {
-        "Firefox".to_string()
-    } else if product.eq_ignore_ascii_case("zen") {
-        "Zen".to_string()
-    } else {
-        product
-    }
+        .unwrap_or_else(|| "Browser".to_string());
+
+    product
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars.flat_map(char::to_lowercase)).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(windows)]
-fn is_firefox_cookie_profile(directory: &Path) -> bool {
-    // Gecko browsers share a profile format, even when they do not register themselves as
-    // Windows default-browser candidates. Requiring the cookie DB plus profile metadata keeps
-    // arbitrary cookies.sqlite files and embedded browser caches out of the picker.
+fn is_gecko_cookie_profile(directory: &Path) -> bool {
+    // Identify this cookie/profile format from its on-disk structure, not its vendor name.
+    // Requiring the cookie DB plus profile metadata keeps arbitrary SQLite files and embedded
+    // browser caches out of the picker.
     directory.join("prefs.js").is_file()
         && (directory.join("places.sqlite").is_file()
             || directory.join("compatibility.ini").is_file())
@@ -582,7 +588,7 @@ fn is_firefox_cookie_profile(directory: &Path) -> bool {
 }
 
 #[cfg(windows)]
-fn firefox_cookie_profile_modified(directory: &Path) -> u64 {
+fn gecko_cookie_profile_modified(directory: &Path) -> u64 {
     std::fs::metadata(directory.join("cookies.sqlite"))
         .and_then(|metadata| metadata.modified())
         .ok()
@@ -592,7 +598,7 @@ fn firefox_cookie_profile_modified(directory: &Path) -> u64 {
 }
 
 #[cfg(windows)]
-fn scan_firefox_profiles(
+fn scan_gecko_cookie_profiles(
     directory: &Path,
     budget: &mut usize,
     found: &mut Vec<DetectedCookieProfile>,
@@ -621,7 +627,7 @@ fn scan_firefox_profiles(
                 continue;
             }
             if name.eq_ignore_ascii_case("profiles") {
-                let browser_name = firefox_profile_browser_name(&path);
+                let browser_name = cookie_profile_product_label(&path);
                 let Ok(profile_entries) = std::fs::read_dir(&path) else { continue };
                 for profile_entry in profile_entries.flatten() {
                     if found.len() >= 128 {
@@ -629,7 +635,7 @@ fn scan_firefox_profiles(
                     }
                     let profile_path = profile_entry.path();
                     if !profile_entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false)
-                        || !is_firefox_cookie_profile(&profile_path)
+                        || !is_gecko_cookie_profile(&profile_path)
                     {
                         continue;
                     }
@@ -637,7 +643,7 @@ fn scan_firefox_profiles(
                         found.push(DetectedCookieProfile {
                             family: "firefox",
                             profile_dir: profile_path.clone(),
-                            modified_secs: firefox_cookie_profile_modified(&profile_path),
+                            modified_secs: gecko_cookie_profile_modified(&profile_path),
                             browser_name: browser_name.clone(),
                             program_ids: Vec::new(),
                         });
@@ -695,15 +701,14 @@ fn detect_installed() -> Vec<BrowserChoice> {
         }
     }
 
-    // Firefox and Firefox-derived browsers use the same identifiable on-disk profile format.
-    // Discover these profiles independently of RegisteredApplications: Firefox/Zen installers
-    // do not consistently publish Default Programs capabilities on every Windows installation.
+    // Discover this profile format independently of RegisteredApplications. This also covers
+    // products whose installers do not publish Default Programs capabilities.
     for appdata in &appdata_roots {
         if !appdata.exists() {
             continue;
         }
         let mut profile_budget = 20_000usize;
-        scan_firefox_profiles(appdata, &mut profile_budget, &mut profiles);
+        scan_gecko_cookie_profiles(appdata, &mut profile_budget, &mut profiles);
     }
 
     // Prefer the most recently used profile when several profiles belong to one browser.
@@ -1436,59 +1441,54 @@ mod browser_tests {
 
     #[cfg(windows)]
     #[test]
-    fn firefox_family_profiles_are_detected_without_default_program_registration() {
-        use super::{firefox_profile_browser_name, is_firefox_cookie_profile};
+    fn cookie_profile_detection_uses_format_and_derives_product_label() {
+        use super::{cookie_profile_product_label, is_gecko_cookie_profile};
         use std::path::Path;
 
         assert_eq!(
-            firefox_profile_browser_name(Path::new(r"C:\Users\Test\AppData\Local\zen\Profiles")),
-            "Zen"
-        );
-        assert_eq!(
-            firefox_profile_browser_name(Path::new(r"C:\Users\Test\AppData\Roaming\Mozilla\Firefox\Profiles")),
-            "Firefox"
+            cookie_profile_product_label(Path::new(r"C:\Users\Test\AppData\Local\some-browser\Profiles")),
+            "Some Browser"
         );
 
         let profile = std::env::temp_dir().join(format!(
-            "senthym-firefox-profile-test-{}",
+            "senthym-cookie-profile-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&profile);
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join("prefs.js"), b"// profile prefs").unwrap();
-        std::fs::write(profile.join("places.sqlite"), b"not needed for signature test").unwrap();
+        std::fs::write(profile.join("places.sqlite"), b"metadata").unwrap();
         std::fs::write(profile.join("cookies.sqlite"), b"SQLite format 3\0").unwrap();
-        assert!(is_firefox_cookie_profile(&profile));
+        assert!(is_gecko_cookie_profile(&profile));
         let _ = std::fs::remove_dir_all(&profile);
     }
 
     #[cfg(windows)]
     #[test]
-    fn zen_is_discovered_from_its_registered_identity_not_webview_folders() {
+    fn registered_product_identity_matches_its_own_data_root_not_webviews() {
         use super::{browser_identity_aliases, is_browser_identity_path, WindowsBrowserRegistration};
-        let zen = WindowsBrowserRegistration {
-            identity: "Zen Browser".into(),
-            name: "Zen Browser".into(),
-            program_ids: vec!["FirefoxURL".into()],
+        let product = WindowsBrowserRegistration {
+            identity: "Acme Browser".into(),
+            name: "Acme Browser".into(),
+            program_ids: vec!["SharedURL".into()],
         };
-        let aliases = browser_identity_aliases(&zen);
-        assert!(is_browser_identity_path("zen", &aliases));
-        assert!(!is_browser_identity_path("Mozilla\\Firefox", &aliases));
-        assert!(!is_browser_identity_path("SomeApp\\WebView2", &aliases));
+        let aliases = browser_identity_aliases(&product);
+        assert!(is_browser_identity_path("Acme/Browser", &aliases));
+        assert!(!is_browser_identity_path("Unrelated/WebView", &aliases));
     }
 
     #[cfg(windows)]
     #[test]
-    fn registered_chromium_data_roots_match_vendor_and_product_path() {
+    fn registered_product_data_roots_match_vendor_and_product_path() {
         use super::{browser_identity_aliases, is_browser_identity_path, WindowsBrowserRegistration};
         let chrome = WindowsBrowserRegistration {
-            identity: "Google Chrome".into(),
-            name: "Google Chrome".into(),
-            program_ids: vec!["ChromeHTML".into()],
+            identity: "Acme Browser".into(),
+            name: "Acme Browser".into(),
+            program_ids: vec!["AcmeHTML".into()],
         };
         let aliases = browser_identity_aliases(&chrome);
-        assert!(is_browser_identity_path("Google\\Chrome", &aliases));
-        assert!(!is_browser_identity_path("Google\\SomeWebView", &aliases));
+        assert!(is_browser_identity_path("Acme\\Browser", &aliases));
+        assert!(!is_browser_identity_path("Acme\\SomeWebView", &aliases));
     }
 
     #[test]
