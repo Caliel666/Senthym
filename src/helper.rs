@@ -321,6 +321,16 @@ fn normalized_browser_text(value: &str) -> String {
     value.chars().filter(|c| c.is_ascii_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
+fn cookie_database_family(filename: &str) -> Option<&'static str> {
+    match filename.to_ascii_lowercase().as_str() {
+        // Firefox-family browsers store their cookie database as cookies.sqlite.
+        "cookies.sqlite" => Some("firefox"),
+        // Chromium-family browsers use a Cookies SQLite database, usually under Network/.
+        "cookies" => Some("chromium"),
+        _ => None,
+    }
+}
+
 #[cfg(windows)]
 fn is_sqlite_database(path: &Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else { return false };
@@ -349,14 +359,8 @@ fn scan_cookie_profiles(
         let path = entry.path();
         let Ok(kind) = entry.file_type() else { continue };
         if kind.is_file() {
-            let filename = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            let family = match filename.as_str() {
-                // Firefox-family browsers store their cookie database as cookies.sqlite.
-                "cookies.sqlite" => Some("firefox"),
-                // Chromium-family browsers use a Cookies SQLite database, usually under Network/.
-                "cookies" => Some("chromium"),
-                _ => None,
-            };
+            let filename = entry.file_name().to_string_lossy();
+            let family = cookie_database_family(&filename);
             let Some(family) = family else { continue };
             if !is_sqlite_database(&path) {
                 continue;
@@ -411,9 +415,11 @@ fn detect_installed() -> Vec<BrowserChoice> {
     let roaming = dirs::data_dir().unwrap_or_default();
     let registrations = windows_registered_browsers();
     let mut profiles = Vec::new();
-    let mut budget = 30_000usize;
+    // Keep independent budgets so a large Local AppData tree cannot starve Roaming
+    // (where standard Firefox profiles are commonly stored).
     for root in [local, roaming] {
         if root.exists() {
+            let mut budget = 15_000usize;
             scan_cookie_profiles(&root, 0, &mut budget, &mut profiles);
         }
     }
@@ -449,11 +455,24 @@ fn windows_default_browser(installed: &[BrowserChoice]) -> Option<String> {
     if hint_normalized.is_empty() {
         return None;
     }
+    // ProgIds often append URL/HTML suffixes (for example, ThoriumHTML or FirefoxURL-...).
+    // Compare their meaningful tokens to the detected profile labels for non-mainstream browsers.
+    let mut tokens = vec![hint_normalized.clone()];
+    for part in hint.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let mut token = normalized_browser_text(part);
+        for suffix in ["url", "html", "htm"] {
+            if token.ends_with(suffix) && token.len() > suffix.len() + 2 {
+                token.truncate(token.len() - suffix.len());
+            }
+        }
+        if token.len() >= 3 && !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
     if let Some(choice) = installed.iter().find(|choice| {
         let label = normalized_browser_text(&choice.label);
         let id = normalized_browser_text(&choice.id);
-        label.contains(&hint_normalized) || hint_normalized.contains(&label) ||
-            id.contains(&hint_normalized) || hint_normalized.contains(&id)
+        tokens.iter().any(|token| label.contains(token) || id.contains(token))
     }) {
         return Some(choice.id.clone());
     }
@@ -1134,7 +1153,20 @@ pub fn ensure_ffmpeg() -> Result<(), String> {
 
 #[cfg(test)]
 mod browser_tests {
-    use super::browser_help;
+    use super::{browser_help, browser_spec, cookie_database_family};
+
+    #[test]
+    fn cookie_database_names_select_the_correct_engine_family() {
+        assert_eq!(cookie_database_family("cookies.sqlite"), Some("firefox"));
+        assert_eq!(cookie_database_family("Cookies"), Some("chromium"));
+        assert_eq!(cookie_database_family("Local State"), None);
+    }
+
+    #[test]
+    fn detected_profile_paths_are_passed_to_ytdlp_without_drive_letter_ambiguity() {
+        let (spec, _) = browser_spec("chromium|AppData/Local/ExampleBrowser/User Data/Default");
+        assert_eq!(spec, "chromium:AppData/Local/ExampleBrowser/User Data/Default");
+    }
 
     #[test]
     fn help_for_a_locked_browser_says_to_close_it() {
