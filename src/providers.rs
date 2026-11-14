@@ -197,8 +197,13 @@ pub fn connect_google(browser: &str) -> Result<(), String> {
     let path = cookie_file();
     let fresh = path.with_extension("new");
     let _ = std::fs::remove_file(&fresh);
-    let out = crate::sys::cmd(bin)
-        .args(["--cookies-from-browser", browser, "--cookies"])
+    let (browser_spec, current_dir) = crate::helper::browser_spec(browser);
+    let mut command = crate::sys::cmd(bin);
+    if let Some(directory) = current_dir {
+        command.current_dir(directory);
+    }
+    let out = command
+        .args(["--cookies-from-browser", &browser_spec, "--cookies"])
         .arg(&fresh)
         .args(["-q", "--no-warnings", "--skip-download", "--flat-playlist", "--playlist-items", "1", "https://music.youtube.com/playlist?list=LM"])
         .output()
